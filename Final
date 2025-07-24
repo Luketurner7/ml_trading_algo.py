@@ -1,38 +1,57 @@
 import numpy as np
 import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, accuracy_score
-import matplotlib.pyplot as plt
 
-# ---------------------
-# CONFIGURATION
-# ---------------------
-WINDOW_SIZE = 10       # lookback window for features
-PRED_HORIZON = 5       # predict price movement 5 days ahead
-CONFIDENCE_THRESHOLD = 0.6  # minimum probability for a confident signal
+# CONFIG
+TICKER = "AAPL"
+START_DATE = "2018-01-01"
+END_DATE = "2023-12-31"
+WINDOW_SIZE = 10
+PRED_HORIZON = 5
+CONFIDENCE_THRESHOLD = 0.6
 RANDOM_STATE = 42
 
-# ---------------------
-# FEATURE ENGINEERING
-# ---------------------
+# Download real data
+def load_data(ticker, start_date, end_date):
+    import yfinance as yf
+    import pandas as pd
+
+    data = yf.download(ticker, start=start_date, end=end_date, progress=False, auto_adjust=False)
+
+    if data.empty:
+        raise ValueError(f"No data fetched for ticker {ticker} between {start_date} and {end_date}")
+    
+    if 'Adj Close' in data.columns:
+        series = data['Adj Close'].dropna()
+    elif 'Close' in data.columns:
+        series = data['Close'].dropna()
+    else:
+        raise ValueError("No 'Adj Close' or 'Close' column found in data")
+    
+    # ✅ Flatten to 1D Series
+    return pd.Series(series.values.ravel(), index=series.index, name='price')
+
+
+
+
+
+
+# Feature engineering
 def extract_features(prices):
     df = pd.DataFrame({'price': prices})
     df['return'] = df['price'].pct_change()
     df['log_return'] = np.log(df['price'] / df['price'].shift(1))
-    
-    # Moving averages
     df['ma5'] = df['price'].rolling(5).mean()
     df['ma10'] = df['price'].rolling(10).mean()
-    
-    # Volatility
     df['volatility_5'] = df['return'].rolling(5).std()
     df['volatility_10'] = df['return'].rolling(10).std()
-    
-    # Momentum
     df['momentum_5'] = df['price'] - df['price'].shift(5)
     df['momentum_10'] = df['price'] - df['price'].shift(10)
-    
+
     # RSI
     delta = df['price'].diff()
     gain = delta.where(delta > 0, 0)
@@ -41,101 +60,77 @@ def extract_features(prices):
     avg_loss = loss.rolling(14).mean()
     rs = avg_gain / avg_loss
     df['rsi_14'] = 100 - (100 / (1 + rs))
-    
-    # Fill NaNs
+
     df = df.fillna(method='bfill').fillna(method='ffill')
-    
     return df.drop(columns=['price'])
 
-# ---------------------
-# LABEL GENERATION
-# ---------------------
+# Label generation
 def generate_labels(prices, horizon):
-    future_price = np.roll(prices, -horizon)
-    labels = (future_price > prices).astype(float)  # convert to float for np.nan
-    labels[-horizon:] = np.nan
+    import pandas as pd
+    labels = (prices.shift(-horizon) > prices).astype(int)
+    labels = labels[:-horizon]  # remove last `horizon` rows which are NaN
     return labels
 
-# ---------------------
-# TRAIN & PREDICT
-# ---------------------
+
+# Model training
 def train_model(X_train, y_train):
     model = RandomForestClassifier(n_estimators=100, random_state=RANDOM_STATE)
     model.fit(X_train, y_train)
     return model
 
-def generate_signals(model, X, confidence_thresh):
-    probs = model.predict_proba(X)
-    prob_up = probs[:, 1]
-    
-    signals = np.zeros(len(prob_up))
-    signals[prob_up >= confidence_thresh] = 1
-    signals[prob_up <= (1 - confidence_thresh)] = -1
-    
+# Signal generation
+def generate_signals(model, X, threshold):
+    prob_up = model.predict_proba(X)[:, 1]
+    signals = np.zeros_like(prob_up)
+    signals[prob_up >= threshold] = 1
+    signals[prob_up <= (1 - threshold)] = -1
     return signals, prob_up
 
-# ---------------------
-# BACKTESTING
-# ---------------------
+# Backtest
 def backtest(prices, signals):
-    returns = pd.Series(prices).pct_change().shift(-1).fillna(0)
-    returns = returns.iloc[:len(signals)]  # align with signal length
+    returns = prices.pct_change().shift(-1).fillna(0)
+    returns = returns.iloc[:len(signals)]
     strategy_returns = returns * signals
     equity_curve = (1 + strategy_returns).cumprod()
     return equity_curve, strategy_returns
 
-# ---------------------
-# MAIN FUNCTION
-# ---------------------
-def main(prices):
-    prices = np.array(prices)
-    
-    # Feature extraction
+# Main
+def main():
+    prices = load_data(TICKER, START_DATE, END_DATE)
+    print("Loaded prices:", prices)
+    print("Type:", type(prices))
+    print("Length:", len(prices))
     features = extract_features(prices)
-    
-    # Label generation
     labels = generate_labels(prices, PRED_HORIZON)
-    
-    # Align features and labels
-    valid_idx = ~np.isnan(labels)
-    X = features.loc[valid_idx].values
-    y = labels[valid_idx].astype(int)
-    
-    # Train/test split
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=RANDOM_STATE, shuffle=False)
-    
-    # Train model
+
+    # Align features and labels on common index to avoid IndexingError
+    common_idx = features.index.intersection(labels.index)
+    X = features.loc[common_idx]
+    y = labels.loc[common_idx].astype(int)
+
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False, random_state=RANDOM_STATE)
+
     model = train_model(X_train, y_train)
-    
-    # Predict on test set
-    signals, confidences = generate_signals(model, X_test, CONFIDENCE_THRESHOLD)
-    
-    # Evaluation
-    print("Classification Report on Test Set:")
-    print(classification_report(y_test, (confidences >= CONFIDENCE_THRESHOLD).astype(int)))
-    print("Accuracy:", accuracy_score(y_test, (confidences >= CONFIDENCE_THRESHOLD).astype(int)))
-    
-    # Backtest
-    test_prices = prices[-len(X_test):]
-    equity_curve, strat_returns = backtest(test_prices, signals)
-    
-    # Plot
+    signals, probs = generate_signals(model, X_test, CONFIDENCE_THRESHOLD)
+
+    print("Classification Report:")
+    print(classification_report(y_test, (probs >= 0.5).astype(int)))
+    print("Accuracy:", accuracy_score(y_test, (probs >= 0.5).astype(int)))
+
+    test_prices = prices.iloc[-len(X_test):]
+    equity_curve, strategy_returns = backtest(test_prices, signals)
+
     plt.figure(figsize=(12,6))
     plt.plot(equity_curve, label="Strategy Equity Curve")
-    plt.title("Strategy Equity Curve Over Test Period")
+    plt.title(f"{TICKER} Strategy Backtest")
     plt.xlabel("Time")
     plt.ylabel("Cumulative Return")
+    plt.grid(True)
     plt.legend()
-    plt.grid()
+    plt.tight_layout()
     plt.show()
 
-    return model, signals, confidences, equity_curve
-
-# ---------------------
-# RUN EXAMPLE
-# ---------------------
+# Run
 if __name__ == "__main__":
-    np.random.seed(RANDOM_STATE)
-    days = 1000
-    prices = np.cumprod(1 + 0.0005 + 0.01 * np.random.randn(days)) * 100
-    model, signals, confidences, equity_curve = main(prices)
+    main()
